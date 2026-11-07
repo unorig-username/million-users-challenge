@@ -435,6 +435,12 @@ typedef struct { int ep, lfd[2], nl, npg; pg_t *pg; time_t retry_at, paused_unti
 static struct { char user[256], pass[256], host[256], port[8], db[256]; } db;  // from DATABASE_URL
 static int nthreads, npg_per;
 static const char *g_host; static int g_ports[2], g_nports;
+// BUSY_POLL=1 (off by default, experimental): each pass ends with a non-blocking 1-byte MSG_PEEK on a Postgres
+// socket. On an empty socket with SO_BUSY_POLL set (no privilege since Linux 6.5), the kernel runs one NAPI poll of
+// the NIC on this CPU (net/ipv4/tcp.c tcp_recvmsg), taking receive work off the CPU the interrupt lands on. It does
+// nothing while that NAPI is already scheduled (net/core/dev.c napi_busy_loop), so it can only help when the
+// interrupt is late, e.g. the IRQ vCPU is stolen by the host. Measure with nstat TcpExtBusyPollRxPackets.
+static int g_busy_poll;
 static const char *cols = "SELECT p.id, p.body, p.created_at, u.username, "
   "(SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id";
 
@@ -537,6 +543,8 @@ static int pg_connect(th_t *t, int i) {
   setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tmo, sizeof tmo); setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tmo, sizeof tmo);
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one); setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
   setsockopt(fd, IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, &one, sizeof one);  // as on client sockets
+  if (g_busy_poll && setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &g_busy_poll, sizeof g_busy_poll))
+    fprintf(stderr, "SO_BUSY_POLL: %s\n", strerror(errno));  // EPERM before Linux 6.5
   int ok = connect(fd, ai->ai_addr, ai->ai_addrlen) == 0; freeaddrinfo(ai);
   if (!ok) { fprintf(stderr, "connect: %s\n", strerror(errno)); close(fd); return 0; }
   l = 8 + snprintf(m + 8, sizeof m - 8, "user%c%s%cdatabase%c%s%c", 0, db.user, 0, 0, db.db, 0) + 1;  // StartupMessage; a last NUL ends the list
@@ -1157,6 +1165,7 @@ static void *run(void *arg) {
       if (p->unsynced) pg_sync(p);
       p->dirty = 0; pg_flush(t, p);
     }
+    if (g_busy_poll && t->pg[0].sock >= 0) { char b; recv(t->pg[0].sock, &b, 1, MSG_PEEK | MSG_DONTWAIT); }
     if (t->paused_until && now_s >= t->paused_until) { t->paused_until = 0; listeners(t, EPOLL_CTL_ADD); }
     // Fixed cadence: a pass that did not fill evs lasts BATCH_NS from its start, so events pile up for the next
     // one and it serves more per wake-up, per Sync and per commit. A full pass goes straight on.
@@ -1175,6 +1184,7 @@ int main(void) {
   if (!dburl || !secret) { fprintf(stderr, "DATABASE_URL and JWT_SECRET are required\n"); return 1; }
   if (!parse_url(dburl)) { fprintf(stderr, "DATABASE_URL must be postgres://user:pass@host:port/db\n"); return 1; }
   g_host = getenv("HOST") ? getenv("HOST") : "0.0.0.0";
+  g_busy_poll = getenv("BUSY_POLL") ? atoi(getenv("BUSY_POLL")) : 0;
   g_ports[g_nports++] = port ? atoi(port) : 3000;
   if (extra && *extra) g_ports[g_nports++] = atoi(extra);
   signal(SIGPIPE, SIG_IGN);
